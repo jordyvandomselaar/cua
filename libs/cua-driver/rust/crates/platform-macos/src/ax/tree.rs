@@ -64,8 +64,8 @@ pub struct AXNode {
     /// The raw AXUIElementRef pointer value, for caching.
     pub element_ptr: usize,
     /// Depth in the rendered markdown tree (matches the indent level used in
-    /// `tree_markdown`). Layout containers AXScrollArea/AXGroup collapse so
-    /// children share the parent's depth.
+    /// `tree_markdown`). Empty, non-actionable AXScrollArea/AXGroup containers
+    /// collapse so children share the parent's depth.
     pub depth: usize,
     /// `element_index` of the nearest actionable ancestor, if any. Walks the
     /// rendered tree (so it skips collapsed layout containers).
@@ -370,31 +370,6 @@ unsafe fn walk_element(
 
     let in_web_content = in_web_content || is_web_content_role(&role);
 
-    // Skip pure layout containers that have no interesting content.
-    if role == "AXScrollArea" || role == "AXGroup" {
-        // Still recurse — children may be interesting. Layout containers
-        // collapse, so children inherit the parent's depth AND the same
-        // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
-        for child in children {
-            walk_element(
-                child,
-                depth,
-                parent_index,
-                in_web_content,
-                nodes,
-                lines,
-                counter,
-                visited_count,
-                truncated,
-                max_elements,
-                max_depth,
-            );
-            CFRelease(child as CFTypeRef);
-        }
-        return;
-    }
-
     // Keep AXTitle and AXDescription SEPARATE so that the tree format matches
     // the Swift reference: title → "title", description → (description).
     // This is critical for Calculator where AXTitle="" but AXDescription="2"
@@ -443,11 +418,16 @@ unsafe fn walk_element(
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
+        let child_depth = if matches!(role.as_str(), "AXScrollArea" | "AXGroup") {
+            depth
+        } else {
+            depth + 1
+        };
         let children = copy_children(element);
         for child in children {
             walk_element(
                 child,
-                depth + 1,
+                child_depth,
                 parent_index,
                 in_web_content,
                 nodes,
