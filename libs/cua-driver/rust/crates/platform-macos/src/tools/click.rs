@@ -9,9 +9,9 @@
 //!   - AXPopUpButton: appends the list of available options and redirects to set_value.
 //!   - Advertised-action warning if the element didn't list the requested action.
 //!
-//! * **Pixel path** (`x`, `y`): synthesises CGEvent mouse clicks and posts them to
-//!   the target pid.  `from_zoom=true` translates zoom-crop pixel coordinates back
-//!   to full-window space using the most recent `zoom` context stored per-pid.
+//! * **Pixel path** (`x`, `y`): sends PID-routed mouse events in background mode
+//!   or global HID events with exact-window focus in foreground mode.
+//!   `from_zoom=true` translates zoom-crop coordinates to full-window pixels.
 
 use async_trait::async_trait;
 use cua_driver_contract::{ClickButton, ClickInput};
@@ -26,11 +26,11 @@ use std::sync::Arc;
 use crate::apps;
 use crate::ax::bindings::{
     copy_action_names, copy_children, copy_string_attr, element_at_screen_position,
-    element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
+    element_screen_rect, AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
-use core_foundation::base::{CFRelease, TCFType};
+use core_foundation::base::CFRelease;
 
 use super::ToolState;
 
@@ -834,17 +834,16 @@ impl Tool for ClickTool {
                         // A window-local point outside the live frame would
                         // dispatch onto whatever occupies that screen point —
                         // the same wrong-surface misclick class as #2237.
-                        // Refuse in background, where the caller cannot see
-                        // what is actually under the translated point.
-                        if !delivery_mode.is_foreground()
-                            && (lx < 0.0
-                                || ly < 0.0
-                                || lx > frame.bounds.width
-                                || ly > frame.bounds.height)
+                        // The foreground HID path must stay inside the exact
+                        // window too; activation does not make other points safe.
+                        if lx < 0.0
+                            || ly < 0.0
+                            || lx >= frame.bounds.width
+                            || ly >= frame.bounds.height
                         {
                             return ToolResult::error(format!(
                                 "click: window-local point ({lx:.1}, {ly:.1}) pt lies outside \
-                                 window {wid}'s {:.0}×{:.0} pt frame; background delivery \
+                                 window {wid}'s {:.0}×{:.0} pt frame; pointer delivery \
                                  refused. Re-read coordinates from a fresh get_window_state \
                                  screenshot.",
                                 frame.bounds.width, frame.bounds.height
@@ -887,17 +886,15 @@ impl Tool for ClickTool {
                 None
             };
 
-            // A background PX action can still use an accessibility delivery
-            // backend after resolving the requested screen point. This keeps
-            // targeting (PX) orthogonal to delivery (AX) and avoids making a
-            // Chromium/AppKit window key merely to satisfy first-mouse rules.
-            if !delivery_mode.is_foreground()
+            // Explicit focus can use AX; a coordinate click must deliver mouse
+            // events so it remains a real fallback from semantic AX actions.
+            if action == "focus"
+                && !delivery_mode.is_foreground()
                 && window_id.is_some()
                 && button_str == "left"
                 && count == 1
                 && modifiers.is_empty()
             {
-                let focus_only = action == "focus";
                 let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
@@ -912,30 +909,24 @@ impl Tool for ClickTool {
                         CFRelease(element as _);
                         return Ok(false);
                     }
-                    let delivered = if focus_only {
-                        crate::input::ax_actions::focus_element(element as usize).is_ok()
-                    } else {
-                        let press = core_foundation::string::CFString::new("AXPress");
-                        AXUIElementPerformAction(element, press.as_concrete_TypeRef())
-                            == kAXErrorSuccess
-                    };
+                    let delivered =
+                        crate::input::ax_actions::focus_element(element as usize).is_ok();
                     CFRelease(element as _);
                     Ok(delivered)
                 })
                 .await;
                 match ax_result {
                     Ok(Ok(true)) => {
-                        let label = if focus_only { "focused" } else { "pressed" };
-                        return ToolResult::text(format!(
-                            "✅ PX hit-test {label} the background element via AX."
-                        ))
+                        return ToolResult::text(
+                            "✅ PX hit-test focused the background element via AX.",
+                        )
                         .with_structured(serde_json::json!({
                             "path": "ax",
                             "verified": false,
                             "effect": "unverifiable"
                         }));
                     }
-                    Ok(Ok(false)) if focus_only => {
+                    Ok(Ok(false)) => {
                         return ToolResult::error(
                             "Background PX focus is unavailable at the requested point.".to_owned(),
                         )
@@ -943,7 +934,7 @@ impl Tool for ClickTool {
                             "code": "background_unavailable"
                         }));
                     }
-                    Ok(Err(error)) if focus_only => {
+                    Ok(Err(error)) => {
                         return ToolResult::error(format!("Background PX focus failed: {error}"))
                             .with_structured(serde_json::json!({
                                 "code": "background_unavailable"
@@ -1048,10 +1039,9 @@ impl Tool for ClickTool {
                 "click.pixel",
                 || async move {
                     tokio::task::spawn_blocking(move || {
-                        let has_modifiers = !mods_owned.is_empty();
                         let do_click = move || -> anyhow::Result<()> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                            if fg && !m.is_empty() {
+                            if fg {
                                 return crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                                     screen_x,
                                     screen_y,
@@ -1095,24 +1085,15 @@ impl Tool for ClickTool {
                                 }
                             }
                         };
-                        // Foreground rung: brief front → click → restore.
-                        // Returns whether the window was ACTUALLY fronted, so the
-                        // reported `path` honestly reflects the rung that ran.
-                        match (fg, window_id, has_modifiers) {
-                            (true, Some(wid), true) => {
+                        // Global input requires proven focus in the exact window.
+                        match (fg, window_id) {
+                            (true, Some(wid)) => {
                                 crate::input::skylight::with_foreground_hid_activation(
                                     pid as libc::pid_t,
                                     wid,
                                     do_click,
                                 )
                                 .map(|_| true)
-                            }
-                            (true, Some(wid), false) => {
-                                crate::input::skylight::with_foreground_assist(
-                                    pid as libc::pid_t,
-                                    wid,
-                                    do_click,
-                                )
                             }
                             _ => do_click().map(|_| false),
                         }
@@ -1154,11 +1135,8 @@ impl Tool for ClickTool {
             };
             match result {
                 Ok(Ok(fronted)) => {
-                    // `with_foreground_assist` returns `false` when the fronting SPIs
-                    // were unavailable and it clicked WITHOUT activation — report the
-                    // background path in that case so `path` reflects the rung that ran.
-                    let (path, mode_label) = if fg && fronted {
-                        ("cgevent_fg", "foreground CGEvent")
+                    let (path, mode_label) = if fronted {
+                        ("cgevent_hid", "foreground HID")
                     } else {
                         ("cgevent", "background CGEvent")
                     };
