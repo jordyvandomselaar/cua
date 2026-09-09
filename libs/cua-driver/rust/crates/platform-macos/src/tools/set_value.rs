@@ -315,13 +315,17 @@ fn set_value_blocking(
     } else {
         // Default path: write AXValue directly. Numeric controls (AXSlider /
         // AXStepper) reject a CFString with -25201 and need a CFNumber; text
-        // fields take a CFString. Try numeric first when the value parses as a
-        // number, then fall back to a string write.
+        // fields take a CFString even when their contents are digits. Chromium
+        // accepts a CFNumber on a text field but clears the rendered value.
         // Numeric target carried through so we can step toward it if the
         // direct writes are rejected (SwiftUI AXSlider rejects every AXValue
         // write with -25200 yet exposes a readable AXValue + increment/decrement
         // actions).
-        let numeric_target = value.trim().parse::<f64>().ok();
+        let numeric_target = value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|_| !matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXComboBox"));
         // Read the value before writing so an unchanged field can be reported as
         // idempotent rather than silently indistinguishable from a fresh write.
         let before = unsafe { copy_string_attr(element, "AXValue") };
