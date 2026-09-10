@@ -59,7 +59,14 @@
   <fieldset>
     <legend>counter</legend>
     <div class="row">
-      <button id="btn-increment"  data-cua-id="btn-increment">Increment</button>
+      <div role="group" aria-label="Counter tools">
+        <div role="group"><div role="group">
+          <button id="btn-increment" data-cua-id="btn-increment">Increment</button>
+        </div></div>
+      </div>
+      <div id="named-group-action" data-cua-id="named-group-action" role="group"
+           tabindex="0" aria-label="Named group action">Group action</div>
+      <span class="mirror" id="lbl-group-count" data-cua-id="lbl-group-count">group_actions=0</span>
       <button id="btn-reset"      data-cua-id="btn-reset">Reset</button>
       <span class="mirror" id="lbl-counter" data-cua-id="lbl-counter">counter=0</span>
     </div>
@@ -209,6 +216,10 @@
   $('btn-reset').addEventListener('click', () => {
     counter = 0;
     $('lbl-counter').textContent = 'counter=0';
+  });
+  let groupActions = 0;
+  $('named-group-action').addEventListener('click', () => {
+    $('lbl-group-count').textContent = `group_actions=${++groupActions}`;
   });
 
   $('editor-save').addEventListener('click', () => {

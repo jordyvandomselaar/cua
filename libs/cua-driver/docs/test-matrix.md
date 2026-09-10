@@ -86,7 +86,12 @@ The shared harness exposes deterministic external markers for these actions:
 
 The Rust shared catalog declares 40 evidence-bearing cells per harness
 application. Windows and Linux run 80 shared cells across Electron and Tauri;
-macOS also runs the native WKWebView host for 120 shared cells. Each host covers
+macOS also runs the native WKWebView host, plus two Electron accessibility
+regression cells, for 122 shared cells. The additional background AX cells
+check named group actions and nested controls, and exact numeric text against
+the fixture journal and desktop-side-effect oracles. Pointer rows check their initial state. macOS PX left-click and
+double-click rows also check the exact mouse-down count to detect missing or
+duplicate dispatch. Each host covers
 the full AX/PX and foreground/background cross-product for click, text,
 keyboard, sequential type-then-Return, scroll, and child-window actions, plus
 both delivery modes for PX drag and AX editor-save. A

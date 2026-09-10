@@ -504,6 +504,7 @@ fn require_element(snapshot: &ToolResponse, id: &str) -> u64 {
         "drag-source" => "Drag source",
         "drop-target" => "Drop target",
         "btn-open-child-window" => "Open child window",
+        "btn-increment" => "Increment",
         _ => id,
     };
     let platform_id = match id {
@@ -746,6 +747,8 @@ fn run_pointer_action(
 ) -> Observation {
     let pre = snapshot(fixture);
     let journal_before = fixture.journal.snapshot();
+    assert_fixture_text(fixture, "lbl-last-action", "last_action=none");
+    assert_fixture_text(fixture, "lbl-click-count", "clicks=0");
     let args = action_target_args(fixture, &pre, "border-click-target", addressing, delivery);
     let response = fixture.driver.call(tool, args);
     if let Some(code) = background_refusal_code(&response, delivery) {
@@ -758,6 +761,17 @@ fn run_pointer_action(
         response.text()
     );
     assert_fixture_contains(fixture, expected_marker);
+    if cfg!(target_os = "macos") && addressing == "px" && matches!(tool, "click" | "double_click") {
+        assert_fixture_text(
+            fixture,
+            "lbl-click-count",
+            if tool == "double_click" {
+                "clicks=2"
+            } else {
+                "clicks=1"
+            },
+        );
+    }
     if tool == "click" {
         assert_native_hyprland_semantic_route(
             fixture,
@@ -838,6 +852,63 @@ fn background_refusal_code(response: &ToolResponse, delivery: &str) -> Option<Re
     response.structured()["code"]
         .as_str()
         .and_then(RefusalCode::from_driver_code)
+}
+
+#[cfg(target_os = "macos")]
+fn run_named_group_action(fixture: &mut Fixture) -> Observation {
+    assert_fixture_text(fixture, "lbl-group-count", "group_actions=0");
+    assert_fixture_text(fixture, "lbl-counter", "counter=0");
+    let pre = snapshot(fixture);
+    let group = pre.structured()["elements"]
+        .as_array()
+        .expect("structured accessibility elements")
+        .iter()
+        .find(|element| element["label"].as_str() == Some("Named group action"))
+        .expect("named accessibility group must remain addressable");
+    assert_eq!(group["role"], "AXGroup");
+    assert!(pre.tree_text().contains("Counter tools"));
+    let token = group["element_token"].as_str().expect("group action token");
+    let response = fixture.driver.call(
+        "click",
+        serde_json::json!({
+            "pid": fixture.pid, "window_id": fixture.wid, "element_token": token,
+        }),
+    );
+    assert!(!response.is_error(), "group click failed: {}", response.raw);
+    assert_fixture_text(fixture, "lbl-group-count", "group_actions=1");
+    assert_fixture_text(fixture, "lbl-counter", "counter=0");
+
+    // The button remains reachable through the named group and empty layout groups.
+    let pre = snapshot(fixture);
+    let args = action_target_args(fixture, &pre, "btn-increment", "ax", "background");
+    let response = fixture.driver.call("click", args);
+    assert!(
+        !response.is_error(),
+        "nested button click failed: {}",
+        response.raw
+    );
+    assert_fixture_text(fixture, "lbl-counter", "counter=1");
+    assert_fixture_text(fixture, "lbl-group-count", "group_actions=1");
+    delivered_observation()
+}
+
+#[cfg(target_os = "macos")]
+fn run_numeric_text_action(fixture: &mut Fixture) -> Observation {
+    assert_fixture_value(fixture, "txt-input", "");
+    assert_fixture_value(fixture, "number-input", "42");
+    let pre = snapshot(fixture);
+    let index = require_element(&pre, "txt-input");
+    let response = fixture.driver.call(
+        "set_value",
+        serde_json::json!({
+            "pid": fixture.pid, "window_id": fixture.wid,
+            "element_index": index, "snapshot_id": pre.snapshot_id(), "value": "007",
+        }),
+    );
+    assert!(!response.is_error(), "text write failed: {}", response.raw);
+    assert_fixture_value(fixture, "txt-input", "007");
+    assert_fixture_value(fixture, "number-input", "42");
+    delivered_observation()
 }
 
 fn run_text_action(fixture: &mut Fixture, addressing: &str, delivery: &str) -> Observation {
@@ -1904,6 +1975,49 @@ fn shared_web_action_matrix_is_state_verified() {
     let mut failure = None;
     let mut selected = 0usize;
     for spec in host_specs() {
+        #[cfg(target_os = "macos")]
+        if spec.name == "electron" {
+            use cua_driver_testkit::e2e::DriverRoute;
+            for (scenario, action, route, run) in [
+                (
+                    "named_group",
+                    "left_click",
+                    DriverRoute::MacosAxAction,
+                    run_named_group_action as fn(&mut Fixture) -> Observation,
+                ),
+                (
+                    "numeric_text",
+                    "set_value",
+                    DriverRoute::MacosAxValue,
+                    run_numeric_text_action as fn(&mut Fixture) -> Observation,
+                ),
+            ] {
+                let case = CaseSpec::delivered(
+                    format!("macos-electron-{scenario}-ax-background").replace('_', "-"),
+                    spec.name,
+                    "chromium",
+                    action,
+                    Targeting::Ax,
+                    Delivery::Background,
+                    Scope::Window,
+                    route,
+                    vec![
+                        OracleKind::FixtureState,
+                        OracleKind::Focus,
+                        OracleKind::ZOrder,
+                        OracleKind::NoLeakedInput,
+                        OracleKind::Cursor,
+                    ],
+                );
+                if cell_selected(&case) {
+                    selected += 1;
+                    let result = run_host_case_with_outcome(case, &spec, run);
+                    if failure.is_none() {
+                        failure = result;
+                    }
+                }
+            }
+        }
         for (action, tool, marker) in [
             ("left_click", "click", "last_action=left_click"),
             ("right_click", "right_click", "last_action=right_click"),
